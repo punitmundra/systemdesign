@@ -88,15 +88,62 @@ For seat status, we can move the "availability check" entirely to **Redis**.
 4.  User A wins the lock (first millisecond). User B gets an "Already being booked" message.
 5.  User A has 5 minutes to pay. If they fail, the Redis key expires, and the seat becomes "AVAILABLE" for the next person in the queue.
 
- I've reviewed the document. It's a solid foundation — the core flows are right. Here's a thorough review with gaps filled in.
+ 
 
 ---
 <img width="1440" height="1356" alt="image" src="https://github.com/user-attachments/assets/2c77a708-8c7c-4989-bdc7-cebee2a8e845" />
 
-## What's good
 
-The document correctly nails the hardest parts — Redis distributed lock with `NX EX`, atomic SQL `WHERE status = 'AVAILABLE'`, and the thundering herd mitigation with a waiting room. These are exactly what interviewers want to hear.
+ — Redis distributed lock with `NX EX`, atomic SQL `WHERE status = 'AVAILABLE'`, and the thundering herd mitigation with a waiting room. These are exactly what interviewers want to hear.
 
+---
+To visualize the architecture of a system like BookMyShow, we break it down into the high-level infrastructure and the low-level logic governing seat transactions.
+
+### 1. High-Level Design (HLD)
+The HLD focuses on the macro-architecture, showing how various microservices interact through a Load Balancer and how data is distributed across different storage layers.
+
+
+
+* **API Gateway:** The entry point for all client requests (Mobile/Web). It handles authentication, rate limiting, and request routing.
+* **Search/Catalog Service:** Backed by **ElasticSearch** or a NoSQL DB like **MongoDB** for fast, full-text searching of movies.
+* **Booking Service:** The core logic engine. It talks to the **Redis** cluster for real-time seat locks and the **PostgreSQL** Master for permanent transactions.
+* **Payment & Notification:** Asynchronous services. Once a booking is marked "Paid" in the DB, a message is pushed to a queue (Kafka/RabbitMQ) for the Notification service to send the ticket.
+
+---
+
+### 2. Low-Level Design (LLD)
+The LLD focuses on the specific logic within the Booking Service, particularly the **Seat Locking State Machine** and the **Database Schema**.
+
+
+
+#### The "Double Booking" Prevention Logic (LLD Flow)
+This diagram illustrates how the system handles the "Two users, one seat" race condition using a distributed lock.
+
+
+
+1.  **Request Arrival:** User A and User B both send a request for `Seat_ID: 55`.
+2.  **Distributed Lock (Redis):** The service executes `SETNX seat_55_lock 1 EX 300`.
+    * **User A** arrives 1ms earlier; the command returns `1` (Success).
+    * **User B**'s command returns `0` (Failure); they receive a "Seat temporarily unavailable" message.
+3.  **Database Transition:**
+    * The system starts a SQL transaction.
+    * `UPDATE seats SET status = 'BLOCKED' WHERE id = 55 AND status = 'AVAILABLE';`
+    * If the update affects 1 row, User A proceeds to the payment gateway.
+4.  **Timer/Webhook:**
+    * If the **Payment Gateway** sends a "Success" webhook, the status changes to `BOOKED`.
+    * If the 5-minute Redis TTL expires or payment fails, the status reverts to `AVAILABLE`.
+
+---
+
+### 3. Database Schema Design (LLD)
+* **City:** `id, name, state`
+* **Cinema:** `id, name, city_id`
+* **Cinema_Hall:** `id, cinema_id, name` (e.g., Screen 1, Screen 2)
+* **Show:** `id, movie_id, hall_id, start_time, end_time`
+* **Seat:** `id, hall_id, row, number, type`
+* **Show_Seat:** `id, show_id, seat_id, price, status (Available/Locked/Booked), user_id`
+
+By decoupling the physical **Seat** from the **Show_Seat**, you can reuse the theater layout for multiple shows throughout the day without data duplication.
 ---
 
 ##  Addon's improvements
